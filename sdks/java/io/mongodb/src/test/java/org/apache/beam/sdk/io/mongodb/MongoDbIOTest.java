@@ -19,10 +19,12 @@ package org.apache.beam.sdk.io.mongodb;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.fail;
 
 import com.mongodb.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.Filters;
 import de.flapdoodle.embed.mongo.MongodExecutable;
 import de.flapdoodle.embed.mongo.MongodProcess;
 import de.flapdoodle.embed.mongo.MongodStarter;
@@ -35,6 +37,7 @@ import de.flapdoodle.embed.mongo.distribution.Version;
 import de.flapdoodle.embed.process.runtime.Network;
 import java.net.ServerSocket;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import org.apache.beam.sdk.testing.PAssert;
 import org.apache.beam.sdk.testing.TestPipeline;
@@ -46,6 +49,8 @@ import org.apache.beam.sdk.transforms.SimpleFunction;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.vendor.guava.v20_0.com.google.common.collect.Iterators;
+import org.bson.BsonDocument;
+import org.bson.BsonString;
 import org.bson.Document;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -194,7 +199,8 @@ public class MongoDbIOTest {
                 .withUri("mongodb://localhost:" + port)
                 .withDatabase(DATABASE)
                 .withCollection(COLLECTION)
-                .withFilter("{\"scientist\":\"Einstein\"}"));
+                .withQueryBuilder(
+                    FindQueryBuilder.create().withFilters(Filters.eq("scientist", "Einstein"))));
 
     PAssert.thatSingleton(output.apply("Count", Count.globally())).isEqualTo(100L);
 
@@ -202,20 +208,89 @@ public class MongoDbIOTest {
   }
 
   @Test
-  public void testReadWithFilterAndProjection() {
+  public void testReadWithFilterAndLimit() throws Exception {
     PCollection<Document> output =
         pipeline.apply(
             MongoDbIO.read()
                 .withUri("mongodb://localhost:" + port)
                 .withDatabase(DATABASE)
                 .withCollection(COLLECTION)
-                .withFilter("{\"scientist\":\"Einstein\"}")
-                .withProjection("country", "scientist"));
+                .withQueryBuilder(
+                    FindQueryBuilder.create()
+                        .withFilters(Filters.eq("scientist", "Einstein"))
+                        .withLimit(5)));
+
+    PAssert.thatSingleton(output.apply("Count", Count.globally())).isEqualTo(5L);
+
+    pipeline.run();
+  }
+
+  @Test
+  public void testReadWithAggregate() throws Exception {
+    // [{ "$match" : { "country" : { "$eq" : "England" } } }]
+    List<BsonDocument> aggregates = new ArrayList<BsonDocument>();
+    aggregates.add(
+        new BsonDocument(
+            "$match",
+            new BsonDocument("country", new BsonDocument("$eq", new BsonString("England")))));
+
+    PCollection<Document> output =
+        pipeline.apply(
+            MongoDbIO.read()
+                .withUri("mongodb://localhost:" + port)
+                .withDatabase(DATABASE)
+                .withCollection(COLLECTION)
+                .withQueryBuilder(
+                    AggregationQueryBuilder.create().withMongoDbPipeline(aggregates)));
+
+    PAssert.thatSingleton(output.apply("Count", Count.globally())).isEqualTo(300L);
+
+    pipeline.run();
+  }
+
+  @Test
+  public void testReadWithBothAggregateAndDocumentId() throws Exception {
+    try {
+      List<BsonDocument> aggregates = new ArrayList<BsonDocument>();
+      aggregates.add(
+          new BsonDocument(
+              "$match",
+              new BsonDocument("country", new BsonDocument("$eq", new BsonString("England")))));
+
+      pipeline.apply(
+          MongoDbIO.read()
+              .withUri("mongodb://localhost:" + port)
+              .withDatabase(DATABASE)
+              .withCollection(COLLECTION)
+              .withQueryBuilder(
+                  FindQueryBuilder.create()
+                      .withId("52cc8f6254c4327843000007")
+                      .withFilters(Filters.eq("scientist", "Einstein"))));
+      pipeline.run();
+    } catch (InvalidParameterException e) {
+      return;
+    }
+
+    fail("assertion should have failed");
+  }
+
+  @Test
+  public void testReadWithFilterAndProjection() throws Exception {
+    PCollection<Document> output =
+        pipeline.apply(
+            MongoDbIO.read()
+                .withUri("mongodb://localhost:" + port)
+                .withDatabase(DATABASE)
+                .withCollection(COLLECTION)
+                .withQueryBuilder(
+                    FindQueryBuilder.create()
+                        .withFilters(Filters.eq("scientist", "Einstein"))
+                        .withProjection(Arrays.asList(new String[] {"country", "scientist"}))));
 
     PAssert.thatSingleton(
             output
                 .apply(
-                    "Map Scientist",
+                    "Map scientist",
                     Filter.by(
                         (Document doc) ->
                             doc.get("country") != null && doc.get("scientist") != null))
@@ -226,14 +301,17 @@ public class MongoDbIOTest {
   }
 
   @Test
-  public void testReadWithProjection() {
+  public void testReadWithProjection() throws Exception {
+
     PCollection<Document> output =
         pipeline.apply(
             MongoDbIO.read()
                 .withUri("mongodb://localhost:" + port)
                 .withDatabase(DATABASE)
                 .withCollection(COLLECTION)
-                .withProjection("country"));
+                .withQueryBuilder(
+                    FindQueryBuilder.create()
+                        .withProjection(Arrays.asList(new String[] {"country"}))));
 
     PAssert.thatSingleton(
             output

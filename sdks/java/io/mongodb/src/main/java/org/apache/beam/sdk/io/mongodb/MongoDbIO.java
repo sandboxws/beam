@@ -17,7 +17,6 @@
  */
 package org.apache.beam.sdk.io.mongodb;
 
-import static com.mongodb.client.model.Projections.include;
 import static org.apache.beam.vendor.guava.v20_0.com.google.common.base.Preconditions.checkArgument;
 
 import com.google.auto.value.AutoValue;
@@ -31,7 +30,6 @@ import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.InsertManyOptions;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import javax.annotation.Nullable;
 import org.apache.beam.sdk.annotations.Experimental;
@@ -42,6 +40,7 @@ import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
@@ -109,6 +108,7 @@ public class MongoDbIO {
         .setSslEnabled(false)
         .setIgnoreSSLCertificate(false)
         .setSslInvalidHostNameAllowed(false)
+        .setQueryBuilder(FindQueryBuilder.create())
         .build();
   }
 
@@ -153,13 +153,9 @@ public class MongoDbIO {
     @Nullable
     abstract String collection();
 
-    @Nullable
-    abstract String filter();
-
-    @Nullable
-    abstract List<String> projection();
-
     abstract int numSplits();
+
+    abstract SerializableFunction<MongoCollection<Document>, MongoCursor<Document>> queryBuilder();
 
     abstract Builder builder();
 
@@ -184,11 +180,10 @@ public class MongoDbIO {
 
       abstract Builder setCollection(String collection);
 
-      abstract Builder setFilter(String filter);
-
-      abstract Builder setProjection(List<String> fieldNames);
-
       abstract Builder setNumSplits(int numSplits);
+
+      abstract Builder setQueryBuilder(
+          SerializableFunction<MongoCollection<Document>, MongoCursor<Document>> queryBuilder);
 
       abstract Read build();
     }
@@ -276,22 +271,15 @@ public class MongoDbIO {
       return builder().setCollection(collection).build();
     }
 
-    /** Sets a filter on the documents in a collection. */
-    public Read withFilter(String filter) {
-      checkArgument(filter != null, "filter can not be null");
-      return builder().setFilter(filter).build();
-    }
-
-    /** Sets a projection on the documents in a collection. */
-    public Read withProjection(final String... fieldNames) {
-      checkArgument(fieldNames.length > 0, "projection can not be null");
-      return builder().setProjection(Arrays.asList(fieldNames)).build();
-    }
-
     /** Sets the user defined number of splits. */
     public Read withNumSplits(int numSplits) {
       checkArgument(numSplits >= 0, "invalid num_splits: must be >= 0, but was %s", numSplits);
       return builder().setNumSplits(numSplits).build();
+    }
+
+    public Read withQueryBuilder(
+        SerializableFunction<MongoCollection<Document>, MongoCursor<Document>> queryBuilderFn) {
+      return builder().setQueryBuilder(queryBuilderFn).build();
     }
 
     @Override
@@ -311,14 +299,8 @@ public class MongoDbIO {
       builder.add(DisplayData.item("sslEnabled", sslEnabled()));
       builder.add(DisplayData.item("sslInvalidHostNameAllowed", sslInvalidHostNameAllowed()));
       builder.add(DisplayData.item("ignoreSSLCertificate", ignoreSSLCertificate()));
-
       builder.add(DisplayData.item("database", database()));
       builder.add(DisplayData.item("collection", collection()));
-      builder.addIfNotNull(DisplayData.item("filter", filter()));
-      if (projection() != null) {
-        builder.addIfNotNull(
-            DisplayData.item("projection", Arrays.toString(projection().toArray())));
-      }
       builder.add(DisplayData.item("numSplit", numSplits()));
     }
   }
@@ -439,9 +421,10 @@ public class MongoDbIO {
         }
 
         LOG.debug("Number of splits is {}", splitKeys.size());
-        for (String shardFilter : splitKeysToFilters(splitKeys, spec.filter())) {
-          sources.add(new BoundedMongoDbSource(spec.withFilter(shardFilter)));
-        }
+        // TODO: What should be done here?
+        // for (String shardFilter : splitKeysToFilters(splitKeys, spec.filter())) {
+        //   sources.add(new BoundedMongoDbSource(spec.withFilter(shardFilter)));
+        // }
 
         return sources;
       }
@@ -542,34 +525,16 @@ public class MongoDbIO {
     @Override
     public boolean start() {
       Read spec = source.spec;
-      client =
-          new MongoClient(
-              new MongoClientURI(
-                  spec.uri(),
-                  getOptions(
-                      spec.keepAlive(),
-                      spec.maxConnectionIdleTime(),
-                      spec.sslEnabled(),
-                      spec.sslInvalidHostNameAllowed())));
 
+      // MongoDB Connection preparation
+      client = createClient(spec);
       MongoDatabase mongoDatabase = client.getDatabase(spec.database());
-
       MongoCollection<Document> mongoCollection = mongoDatabase.getCollection(spec.collection());
 
-      if (spec.filter() == null) {
-        if (spec.projection() == null) {
-          cursor = mongoCollection.find().iterator();
-        } else {
-          cursor = mongoCollection.find().projection(include(spec.projection())).iterator();
-        }
-      } else {
-        Document bson = Document.parse(spec.filter());
-        if (spec.projection() == null) {
-          cursor = mongoCollection.find(bson).iterator();
-        } else {
-          cursor = mongoCollection.find(bson).projection(include(spec.projection())).iterator();
-        }
+      if (spec.queryBuilder() == null) {
+        throw new InvalidParameterException("A QueryBuilder must be provided.");
       }
+      cursor = spec.queryBuilder().apply(mongoCollection);
 
       return advance();
     }
@@ -608,6 +573,17 @@ public class MongoDbIO {
       } catch (Exception e) {
         LOG.warn("Error closing MongoDB client", e);
       }
+    }
+
+    private MongoClient createClient(Read spec) {
+      return new MongoClient(
+          new MongoClientURI(
+              spec.uri(),
+              getOptions(
+                  spec.keepAlive(),
+                  spec.maxConnectionIdleTime(),
+                  spec.sslEnabled(),
+                  spec.sslInvalidHostNameAllowed())));
     }
   }
 
