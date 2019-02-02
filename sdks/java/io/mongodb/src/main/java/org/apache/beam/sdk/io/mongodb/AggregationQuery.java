@@ -25,12 +25,12 @@ import org.bson.BsonDocument;
 import org.bson.Document;
 
 /** Builds a MongoDB AggregateIterable object. */
-public class AggregationQueryBuilder
+public class AggregationQuery
     implements SerializableFunction<MongoCollection<Document>, MongoCursor<Document>> {
 
   private List<BsonDocument> mongoDbPipeline;
 
-  public AggregationQueryBuilder withMongoDbPipeline(List<BsonDocument> mongoDbPipeline) {
+  public AggregationQuery withMongoDbPipeline(List<BsonDocument> mongoDbPipeline) {
     this.mongoDbPipeline = mongoDbPipeline;
     return this;
   }
@@ -40,7 +40,7 @@ public class AggregationQueryBuilder
     return collection.aggregate(mongoDbPipeline).iterator();
   }
 
-  public static AggregationQueryBuilder create() {
-    return new AggregationQueryBuilder();
+  public static AggregationQuery create() {
+    return new AggregationQuery();
   }
 }
