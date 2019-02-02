@@ -17,6 +17,7 @@
  */
 package org.apache.beam.sdk.io.mongodb;
 
+import static org.apache.beam.sdk.io.mongodb.FindQuery.bson2BsonDocument;
 import static org.apache.beam.vendor.guava.v20_0.com.google.common.base.Preconditions.checkArgument;
 
 import com.google.auto.value.AutoValue;
@@ -25,11 +26,14 @@ import com.mongodb.MongoBulkWriteException;
 import com.mongodb.MongoClient;
 import com.mongodb.MongoClientOptions;
 import com.mongodb.MongoClientURI;
+import com.mongodb.client.AggregateIterable;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.InsertManyOptions;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import javax.annotation.Nullable;
 import org.apache.beam.sdk.annotations.Experimental;
@@ -46,6 +50,9 @@ import org.apache.beam.sdk.values.PBegin;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PDone;
 import org.apache.beam.vendor.guava.v20_0.com.google.common.annotations.VisibleForTesting;
+import org.bson.BsonDocument;
+import org.bson.BsonInt32;
+import org.bson.BsonString;
 import org.bson.Document;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -105,10 +112,11 @@ public class MongoDbIO {
         .setKeepAlive(true)
         .setMaxConnectionIdleTime(60000)
         .setNumSplits(0)
+        .setBucketAuto(false)
         .setSslEnabled(false)
         .setIgnoreSSLCertificate(false)
         .setSslInvalidHostNameAllowed(false)
-        .setQueryBuilder(FindQueryBuilder.create())
+        .setQueryFn(FindQuery.create())
         .build();
   }
 
@@ -155,13 +163,16 @@ public class MongoDbIO {
 
     abstract int numSplits();
 
-    abstract SerializableFunction<MongoCollection<Document>, MongoCursor<Document>> queryBuilder();
+    abstract boolean bucketAuto();
+
+    abstract SerializableFunction<MongoCollection<Document>, MongoCursor<Document>> queryFn();
 
     abstract Builder builder();
 
     @AutoValue.Builder
     abstract static class Builder {
       abstract Builder setUri(String uri);
+
       /**
        * @deprecated This is deprecated in the MongoDB API and will be removed in a future version.
        */
@@ -182,7 +193,9 @@ public class MongoDbIO {
 
       abstract Builder setNumSplits(int numSplits);
 
-      abstract Builder setQueryBuilder(
+      abstract Builder setBucketAuto(boolean bucketAuto);
+
+      abstract Builder setQueryFn(
           SerializableFunction<MongoCollection<Document>, MongoCursor<Document>> queryBuilder);
 
       abstract Read build();
@@ -271,15 +284,57 @@ public class MongoDbIO {
       return builder().setCollection(collection).build();
     }
 
+    /**
+     * Sets a filter on the documents in a collection.
+     *
+     * @deprecated Filtering manually is discouraged. Use {@link #withQueryFn(SerializableFunction)
+     *     with {@link FindQuery#withFilters(Bson)} as an argument to set up the projection}.
+     */
+    @Deprecated
+    public Read withFilter(String filter) {
+      checkArgument(filter != null, "filter can not be null");
+      checkArgument(
+          this.queryFn().getClass() != FindQuery.class,
+          "withFilter is only supported for FindQuery API");
+      FindQuery findQuery = (FindQuery) queryFn();
+      FindQuery queryWithFilter =
+          findQuery.toBuilder().setFilters(bson2BsonDocument(Document.parse(filter))).build();
+      return builder().setQueryFn(queryWithFilter).build();
+    }
+
+    /**
+     * Sets a projection on the documents in a collection.
+     *
+     * @deprecated Use {@link #withQueryFn(SerializableFunction) with {@link
+     *     FindQuery#withProjection(List)} as an argument to set up the projection}.
+     */
+    @Deprecated
+    public Read withProjection(final String... fieldNames) {
+      checkArgument(fieldNames.length > 0, "projection can not be null");
+      checkArgument(
+          this.queryFn().getClass() != FindQuery.class,
+          "withFilter is only supported for FindQuery API");
+      FindQuery findQuery = (FindQuery) queryFn();
+      FindQuery queryWithProjection =
+          findQuery.toBuilder().setProjection(Arrays.asList(fieldNames)).build();
+      return builder().setQueryFn(queryWithProjection).build();
+    }
+
     /** Sets the user defined number of splits. */
     public Read withNumSplits(int numSplits) {
       checkArgument(numSplits >= 0, "invalid num_splits: must be >= 0, but was %s", numSplits);
       return builder().setNumSplits(numSplits).build();
     }
 
-    public Read withQueryBuilder(
+    /** Sets weather to use $bucketAuto or not. */
+    public Read withBucketAuto(boolean bucketAuto) {
+      return builder().setBucketAuto(bucketAuto).build();
+    }
+
+    /** Sets a queryFn. */
+    public Read withQueryFn(
         SerializableFunction<MongoCollection<Document>, MongoCursor<Document>> queryBuilderFn) {
-      return builder().setQueryBuilder(queryBuilderFn).build();
+      return builder().setQueryFn(queryBuilderFn).build();
     }
 
     @Override
@@ -302,6 +357,8 @@ public class MongoDbIO {
       builder.add(DisplayData.item("database", database()));
       builder.add(DisplayData.item("collection", collection()));
       builder.add(DisplayData.item("numSplit", numSplits()));
+      builder.add(DisplayData.item("bucketAuto", bucketAuto()));
+      builder.add(DisplayData.item("queryFn", queryFn().toString()));
     }
   }
 
@@ -387,47 +444,92 @@ public class MongoDbIO {
                       spec.sslInvalidHostNameAllowed())))) {
         MongoDatabase mongoDatabase = mongoClient.getDatabase(spec.database());
 
-        List<Document> splitKeys;
-        if (spec.numSplits() > 0) {
-          // the user defines his desired number of splits
-          // calculate the batch size
-          long estimatedSizeBytes =
-              getEstimatedSizeBytes(mongoClient, spec.database(), spec.collection());
-          desiredBundleSizeBytes = estimatedSizeBytes / spec.numSplits();
+        List<Document> splitKeys = new ArrayList<>();
+
+        if (spec.queryFn().getClass() == AutoValue_FindQuery.class && !spec.bucketAuto()) {
+          if (spec.numSplits() > 0) {
+            // the user defines his desired number of splits
+            // calculate the batch size
+            long estimatedSizeBytes =
+                getEstimatedSizeBytes(mongoClient, spec.database(), spec.collection());
+            desiredBundleSizeBytes = estimatedSizeBytes / spec.numSplits();
+          }
+
+          // the desired batch size is small, using default chunk size of 1MB
+          if (desiredBundleSizeBytes < 1024L * 1024L) {
+            desiredBundleSizeBytes = 1024L * 1024L;
+          }
+
+          // now we have the batch size (provided by user or provided by the runner)
+          // we use Mongo splitVector command to get the split keys
+          BasicDBObject splitVectorCommand = new BasicDBObject();
+          splitVectorCommand.append("splitVector", spec.database() + "." + spec.collection());
+          splitVectorCommand.append("keyPattern", new BasicDBObject().append("_id", 1));
+          splitVectorCommand.append("force", false);
+          // maxChunkSize is the Mongo partition size in MB
+          LOG.debug("Splitting in chunk of {} MB", desiredBundleSizeBytes / 1024 / 1024);
+          splitVectorCommand.append("maxChunkSize", desiredBundleSizeBytes / 1024 / 1024);
+          Document splitVectorCommandResult = mongoDatabase.runCommand(splitVectorCommand);
+          splitKeys = (List<Document>) splitVectorCommandResult.get("splitKeys");
+        } else {
+          MongoCollection<Document> mongoCollection =
+              mongoDatabase.getCollection(spec.collection());
+          BsonDocument bucketAutoConfig = new BsonDocument();
+          bucketAutoConfig.put("groupBy", new BsonString("$_id"));
+          // 10 is the default number of buckets
+          bucketAutoConfig.put(
+              "buckets", new BsonInt32(spec.numSplits() > 0 ? spec.numSplits() : 10));
+          BsonDocument bucketAuto = new BsonDocument("$bucketAuto", bucketAutoConfig);
+          List<BsonDocument> aggregates = new ArrayList<BsonDocument>();
+          aggregates.add(bucketAuto);
+          AggregateIterable<Document> buckets = mongoCollection.aggregate(aggregates);
+
+          for (Document bucket : buckets) {
+            Document filter = new Document();
+            filter.put("_id", ((Document) bucket.get("_id")).get("min"));
+            splitKeys.add(filter);
+          }
         }
 
-        // the desired batch size is small, using default chunk size of 1MB
-        if (desiredBundleSizeBytes < 1024L * 1024L) {
-          desiredBundleSizeBytes = 1024L * 1024L;
-        }
-
-        // now we have the batch size (provided by user or provided by the runner)
-        // we use Mongo splitVector command to get the split keys
-        BasicDBObject splitVectorCommand = new BasicDBObject();
-        splitVectorCommand.append("splitVector", spec.database() + "." + spec.collection());
-        splitVectorCommand.append("keyPattern", new BasicDBObject().append("_id", 1));
-        splitVectorCommand.append("force", false);
-        // maxChunkSize is the Mongo partition size in MB
-        LOG.debug("Splitting in chunk of {} MB", desiredBundleSizeBytes / 1024 / 1024);
-        splitVectorCommand.append("maxChunkSize", desiredBundleSizeBytes / 1024 / 1024);
-        Document splitVectorCommandResult = mongoDatabase.runCommand(splitVectorCommand);
-        splitKeys = (List<Document>) splitVectorCommandResult.get("splitKeys");
-
-        List<BoundedSource<Document>> sources = new ArrayList<>();
         if (splitKeys.size() < 1) {
           LOG.debug("Split keys is low, using an unique source");
-          sources.add(this);
-          return sources;
+          return Collections.singletonList(this);
         }
 
         LOG.debug("Number of splits is {}", splitKeys.size());
-        // TODO: What should be done here?
-        // for (String shardFilter : splitKeysToFilters(splitKeys, spec.filter())) {
-        //   sources.add(new BoundedMongoDbSource(spec.withFilter(shardFilter)));
-        // }
+
+        // TODO Ismael What happens to splitting when you have aggregates?
+        List<BoundedSource<Document>> sources = new ArrayList<>();
+        for (String shardFilter : splitKeysToFilters(splitKeys)) {
+          BsonDocument filters = bson2BsonDocument(Document.parse(shardFilter));
+          SerializableFunction<MongoCollection<Document>, MongoCursor<Document>> queryFn =
+              spec.queryFn();
+          if (queryFn.getClass() == FindQuery.class) {
+            FindQuery findQuery = (FindQuery) spec.queryFn();
+            FindQuery queryWithFilter = findQuery.toBuilder().setFilters(filters).build();
+            sources.add(new BoundedMongoDbSource(spec.withQueryFn(queryWithFilter)));
+          } else {
+            List<BsonDocument> aggregates = new ArrayList<BsonDocument>();
+            aggregates.add(new BsonDocument("$match", filters));
+            AggregationQuery queryWithFilter =
+                AggregationQuery.create().withMongoDbPipeline(aggregates);
+            sources.add(new BoundedMongoDbSource(spec.withQueryFn(queryWithFilter)));
+          }
+        }
 
         return sources;
       }
+    }
+
+    private static String getFilterFromRead(Read spec) {
+      SerializableFunction<MongoCollection<Document>, MongoCursor<Document>> queryFn =
+          spec.queryFn();
+      if (queryFn.getClass() == FindQuery.class) {
+        FindQuery findQuery = (FindQuery) queryFn;
+        BsonDocument filters = findQuery.filters();
+        return filters.toString();
+      }
+      return null;
     }
 
     /**
@@ -453,11 +555,10 @@ public class MongoDbIO {
      * </ul>
      *
      * @param splitKeys The list of split keys.
-     * @param additionalFilter A custom (user) additional filter to append to the range filters.
      * @return A list of filters containing the ranges.
      */
     @VisibleForTesting
-    static List<String> splitKeysToFilters(List<Document> splitKeys, String additionalFilter) {
+    static List<String> splitKeysToFilters(List<Document> splitKeys) {
       ArrayList<String> filters = new ArrayList<>();
       String lowestBound = null; // lower boundary (previous split in the iteration)
       for (int i = 0; i < splitKeys.size(); i++) {
@@ -467,7 +568,7 @@ public class MongoDbIO {
           // this is the first split in the list, the filter defines
           // the range from the beginning up to this split
           rangeFilter = String.format("{ $and: [ {\"_id\":{$lte:ObjectId(\"%s\")}}", splitKey);
-          filters.add(formatFilter(rangeFilter, additionalFilter));
+          filters.add(String.format("%s ]}", rangeFilter));
         } else if (i == splitKeys.size() - 1) {
           // this is the last split in the list, the filters define
           // the range from the previous split to the current split and also
@@ -476,16 +577,16 @@ public class MongoDbIO {
               String.format(
                   "{ $and: [ {\"_id\":{$gt:ObjectId(\"%s\")," + "$lte:ObjectId(\"%s\")}}",
                   lowestBound, splitKey);
-          filters.add(formatFilter(rangeFilter, additionalFilter));
+          filters.add(String.format("%s ]}", rangeFilter));
           rangeFilter = String.format("{ $and: [ {\"_id\":{$gt:ObjectId(\"%s\")}}", splitKey);
-          filters.add(formatFilter(rangeFilter, additionalFilter));
+          filters.add(String.format("%s ]}", rangeFilter));
         } else {
           // we are between two splits
           rangeFilter =
               String.format(
                   "{ $and: [ {\"_id\":{$gt:ObjectId(\"%s\")," + "$lte:ObjectId(\"%s\")}}",
                   lowestBound, splitKey);
-          filters.add(formatFilter(rangeFilter, additionalFilter));
+          filters.add(String.format("%s ]}", rangeFilter));
         }
 
         lowestBound = splitKey;
@@ -497,17 +598,11 @@ public class MongoDbIO {
      * Cleanly format range filter, optionally adding the users filter if specified.
      *
      * @param filter The range filter.
-     * @param additionalFilter The users filter. Null if unspecified.
      * @return The cleanly formatted range filter.
      */
-    private static String formatFilter(String filter, @Nullable String additionalFilter) {
-      if (additionalFilter != null && !additionalFilter.isEmpty()) {
-        // user provided a filter, we append the user filter to the range filter
-        return String.format("%s,%s ]}", filter, additionalFilter);
-      } else {
-        // user didn't provide a filter, just cleanly close the range filter
-        return String.format("%s ]}", filter);
-      }
+    private static String formatFilter(String filter) {
+      // user didn't provide a filter, just cleanly close the range filter
+      return String.format("%s ]}", filter);
     }
   }
 
@@ -530,12 +625,7 @@ public class MongoDbIO {
       client = createClient(spec);
       MongoDatabase mongoDatabase = client.getDatabase(spec.database());
       MongoCollection<Document> mongoCollection = mongoDatabase.getCollection(spec.collection());
-
-      if (spec.queryBuilder() == null) {
-        throw new InvalidParameterException("A QueryBuilder must be provided.");
-      }
-      cursor = spec.queryBuilder().apply(mongoCollection);
-
+      cursor = spec.queryFn().apply(mongoCollection);
       return advance();
     }
 
@@ -544,9 +634,8 @@ public class MongoDbIO {
       if (cursor.hasNext()) {
         current = cursor.next();
         return true;
-      } else {
-        return false;
       }
+      return false;
     }
 
     @Override
@@ -593,6 +682,7 @@ public class MongoDbIO {
 
     @Nullable
     abstract String uri();
+
     /**
      * @deprecated This is deprecated in the MongoDB API and will be removed in a future version.
      */
@@ -622,6 +712,7 @@ public class MongoDbIO {
     @AutoValue.Builder
     abstract static class Builder {
       abstract Builder setUri(String uri);
+
       /**
        * @deprecated This is deprecated in the MongoDB API and will be removed in a future version.
        */

@@ -19,7 +19,6 @@ package org.apache.beam.sdk.io.mongodb;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.fail;
 
 import com.mongodb.MongoClient;
 import com.mongodb.client.MongoCollection;
@@ -124,7 +123,7 @@ public class MongoDbIOTest {
     documents.add(new Document("_id", 56));
     documents.add(new Document("_id", 109));
     documents.add(new Document("_id", 256));
-    List<String> filters = MongoDbIO.BoundedMongoDbSource.splitKeysToFilters(documents, null);
+    List<String> filters = MongoDbIO.BoundedMongoDbSource.splitKeysToFilters(documents);
     assertEquals(4, filters.size());
     assertEquals("{ $and: [ {\"_id\":{$lte:ObjectId(\"56\")}} ]}", filters.get(0));
     assertEquals(
@@ -199,8 +198,7 @@ public class MongoDbIOTest {
                 .withUri("mongodb://localhost:" + port)
                 .withDatabase(DATABASE)
                 .withCollection(COLLECTION)
-                .withQueryBuilder(
-                    FindQueryBuilder.create().withFilters(Filters.eq("scientist", "Einstein"))));
+                .withQueryFn(FindQuery.create().withFilters(Filters.eq("scientist", "Einstein"))));
 
     PAssert.thatSingleton(output.apply("Count", Count.globally())).isEqualTo(100L);
 
@@ -215,8 +213,8 @@ public class MongoDbIOTest {
                 .withUri("mongodb://localhost:" + port)
                 .withDatabase(DATABASE)
                 .withCollection(COLLECTION)
-                .withQueryBuilder(
-                    FindQueryBuilder.create()
+                .withQueryFn(
+                    FindQuery.create()
                         .withFilters(Filters.eq("scientist", "Einstein"))
                         .withLimit(5)));
 
@@ -240,38 +238,11 @@ public class MongoDbIOTest {
                 .withUri("mongodb://localhost:" + port)
                 .withDatabase(DATABASE)
                 .withCollection(COLLECTION)
-                .withQueryBuilder(
-                    AggregationQueryBuilder.create().withMongoDbPipeline(aggregates)));
+                .withQueryFn(AggregationQuery.create().withMongoDbPipeline(aggregates)));
 
     PAssert.thatSingleton(output.apply("Count", Count.globally())).isEqualTo(300L);
 
     pipeline.run();
-  }
-
-  @Test
-  public void testReadWithBothAggregateAndDocumentId() throws Exception {
-    try {
-      List<BsonDocument> aggregates = new ArrayList<BsonDocument>();
-      aggregates.add(
-          new BsonDocument(
-              "$match",
-              new BsonDocument("country", new BsonDocument("$eq", new BsonString("England")))));
-
-      pipeline.apply(
-          MongoDbIO.read()
-              .withUri("mongodb://localhost:" + port)
-              .withDatabase(DATABASE)
-              .withCollection(COLLECTION)
-              .withQueryBuilder(
-                  FindQueryBuilder.create()
-                      .withId("52cc8f6254c4327843000007")
-                      .withFilters(Filters.eq("scientist", "Einstein"))));
-      pipeline.run();
-    } catch (InvalidParameterException e) {
-      return;
-    }
-
-    fail("assertion should have failed");
   }
 
   @Test
@@ -282,8 +253,8 @@ public class MongoDbIOTest {
                 .withUri("mongodb://localhost:" + port)
                 .withDatabase(DATABASE)
                 .withCollection(COLLECTION)
-                .withQueryBuilder(
-                    FindQueryBuilder.create()
+                .withQueryFn(
+                    FindQuery.create()
                         .withFilters(Filters.eq("scientist", "Einstein"))
                         .withProjection(Arrays.asList(new String[] {"country", "scientist"}))));
 
@@ -309,9 +280,8 @@ public class MongoDbIOTest {
                 .withUri("mongodb://localhost:" + port)
                 .withDatabase(DATABASE)
                 .withCollection(COLLECTION)
-                .withQueryBuilder(
-                    FindQueryBuilder.create()
-                        .withProjection(Arrays.asList(new String[] {"country"}))));
+                .withQueryFn(
+                    FindQuery.create().withProjection(Arrays.asList(new String[] {"country"}))));
 
     PAssert.thatSingleton(
             output
